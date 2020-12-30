@@ -11,6 +11,9 @@
 // Include the accelerometer Library
 #include <MPU6050_light.h>  // https://github.com/rfetick/MPU6050_light
 
+// Include the accelerometer Library
+#include <TinyGPS++.h>      // https://github.com/mikalhart/TinyGPSPlus
+
 // Serial port usage
 #define USB_SERIAL_PORT Serial
 #define GPS_SERIAL_PORT Serial2
@@ -29,13 +32,16 @@ int32_t const DECAcceleration(50);
 U8X8_SSD1306_128X32_UNIVISION_HW_I2C display;
 
 // Keypad parameters
-uint8_t const KEY_ROW_1_ADC(36);
-uint8_t const KEY_ROW_2_ADC(39);
-uint8_t const KEY_ROW_3_ADC(34);
+uint8_t const LCD_KEY_SENSE_X_PIN(34);
+uint8_t const LCD_KEY_SENSE_Y_PIN(39);
+uint8_t const LCD_KEY_SENSE_PUSH_PIN(36);
 uint8_t getKey();
 
 // Gyro parameters
 MPU6050 mpu(Wire);
+
+// GPS engine
+TinyGPSPlus gps;
 
 // Task control
 TaskHandle_t movementTaskHandle(0);
@@ -81,7 +87,7 @@ void setup() {
     USB_SERIAL_PORT.println("ERROR: Tilt sensor not detected!");
 
   // Initialize GPS
-  GPS_SERIAL_PORT.begin(57600, SERIAL_8N1);
+  GPS_SERIAL_PORT.begin(9600, SERIAL_8N1);
 
   // Initialise display
   display.begin();
@@ -98,12 +104,11 @@ void setup() {
   for (int i=0; i<16; i++) {
     display.draw1x2Glyph(i,2,64+i);
   }
-  while(true);
 
   // Initialize keypad
-  pinMode(KEY_ROW_1_ADC, INPUT);
-  pinMode(KEY_ROW_2_ADC, INPUT);
-  pinMode(KEY_ROW_3_ADC, INPUT);
+  pinMode(LCD_KEY_SENSE_X_PIN, INPUT);
+  pinMode(LCD_KEY_SENSE_Y_PIN, INPUT);
+  pinMode(LCD_KEY_SENSE_PUSH_PIN, INPUT);
 
   // Start the pattern
   // RAStepper.moveTo(RAMaxSteps);
@@ -169,13 +174,13 @@ void runUserInterface() {
 
   //----------------------------------------------------------------------------
   // Check for commands from the serial port/keypad
-  //  A/4     Decrement the RA axis (clockwise from front)
-  //  D/6     Increment the RA axis (clockwise from front)
-  //  S/8     Decrement the DEC axis (decrease elevation)
-  //  W/2     Increment the DEC axis (increment elevation)
-  //  Q/7     Stop all movement 
-  //  E/1     Begin moving in pattern through full movement
-  //  X/3,9   Disable motors
+  //  A     Decrement the RA axis (clockwise from front)
+  //  D     Increment the RA axis (clockwise from front)
+  //  S     Decrement the DEC axis (decrease elevation)
+  //  W     Increment the DEC axis (increment elevation)
+  //  Q     Stop all movement 
+  //  E     Toggle moving in pattern through full movement
+  //  X     Disable motors
 
   // For serial port commands action will continue to run until a new key is pressed
   uint8_t keys(0); 
@@ -192,42 +197,44 @@ void runUserInterface() {
   if (keys) {
     switch(keys) {
       case 's':   // Move down
-      case 8:
         DECStepper.setSpeed(DECMaxSpeed);
         currentMode = MOVE_MANUAL;
       break;
       case 'w':   // Move up
-      case 2:
         DECStepper.setSpeed(-DECMaxSpeed);
         currentMode = MOVE_MANUAL;
       break;
       case 'a':   // Move left
-      case 4:
         RAStepper.setSpeed(-RAMaxSpeed);
         currentMode = MOVE_MANUAL;
       break;
       case 'd':   // Move right
-      case 6:
         RAStepper.setSpeed(RAMaxSpeed);
         currentMode = MOVE_MANUAL;
       break;
-      case 'e':   // Start moving through limited pattern
-      case 1:
-        RAStepper.setCurrentPosition(0);
-        RAStepper.moveTo(RAMaxSteps);
-        DECStepper.setCurrentPosition(0);
-        DECStepper.moveTo(DECMaxSteps);
-        currentMode = MOVE_PATTERN;
+      case 'e':   // Toggle moving through limited pattern
+        if (currentMode == MOVE_PATTERN) {
+          // Stop moving
+          RAStepper.setSpeed(0);
+          DECStepper.setSpeed(0);
+          RAStepper.stop();
+          DECStepper.stop();
+          currentMode = MOVE_MANUAL;
+        } else {
+          // Start moving
+          RAStepper.setCurrentPosition(0);
+          RAStepper.moveTo(RAMaxSteps);
+          DECStepper.setCurrentPosition(0);
+          DECStepper.moveTo(DECMaxSteps);
+          currentMode = MOVE_PATTERN;
+        }
       break;
       case 'x':   // Disable motors
-      case 3:
-      case 9:
         RAStepper.disableOutputs();
         DECStepper.disableOutputs();
         currentMode = STOP_DISABLED;
       break;
       case 'q':   // Stop moving
-      case 7:
       default:
         RAStepper.setSpeed(0);
         DECStepper.setSpeed(0);
@@ -236,6 +243,25 @@ void runUserInterface() {
         currentMode = MOVE_MANUAL;
       break;
     }
+  }
+
+  //----------------------------------------------------------------------------
+  // Read new data from the GPS receiver
+
+  static uint32_t gpsTimer(0);
+
+  while (GPS_SERIAL_PORT.available() > 0) {
+    gps.encode(GPS_SERIAL_PORT.read());
+  }
+
+  if((millis()-gpsTimer) > 1000) { 
+    if (gps.location.isUpdated()) {
+      sprintf(buffer, "GPS: time=%u, lat:%.3f, lng=%.3f, height=%.1f", gps.time.value(),gps.location.lat(),gps.location.lng(),gps.altitude.meters());
+      USB_SERIAL_PORT.println(buffer);
+    }
+    sprintf(buffer, "GPS: Passed=%d, Failed=%d, Fixes=%d", gps.passedChecksum(), gps.failedChecksum(),gps.sentencesWithFix());
+    USB_SERIAL_PORT.println(buffer);
+    gpsTimer = millis();  
   }
 
   //----------------------------------------------------------------------------
@@ -255,13 +281,15 @@ void runUserInterface() {
   // Read the keypad
 
   static uint32_t keypadTimer(0);
+  static uint8_t lastKey(0);
 
   if((millis()-keypadTimer) > 100) { 
     uint8_t key(getKey());
-    if (key != scannedKey) {
-      sprintf(buffer, "Key: %d.", key);
+    if (key != lastKey) {
+      sprintf(buffer, "Key: '%c'.", key);
       USB_SERIAL_PORT.println(buffer);
-      scannedKey = key;
+      lastKey = key;    // Debounce
+      scannedKey = key; // Forward for processing
     }
     keypadTimer = millis();  
   }
@@ -287,37 +315,26 @@ void runUserInterface() {
  * This is a hacked 3x3 matrix keypad. Probably not reusable.
 */
 uint8_t getKey() {
+  uint16_t x(analogRead(LCD_KEY_SENSE_X_PIN));
+  uint16_t y(analogRead(LCD_KEY_SENSE_Y_PIN));
+  bool push(digitalRead(LCD_KEY_SENSE_PUSH_PIN) == LOW);  // Active low
 
-  uint16_t r1(analogRead(KEY_ROW_1_ADC));
-  uint16_t r2(analogRead(KEY_ROW_2_ADC));
-  uint16_t r3(analogRead(KEY_ROW_3_ADC));
+  // Assumes analogReadResolution(12) (the default)
+  int16_t const MIDSCALE = 4096 / 2;
+  int16_t const DEADBAND = 500;
 
-  
-  sprintf(buffer,"Keyscan: R1=%4d, R2=%4d, R3=%4d.",r1,r2,r3);
-  USB_SERIAL_PORT.println(buffer);
-  
+  byte keyState = 0;
+  if (x > (MIDSCALE + DEADBAND)) keyState = 'd';
+  if (x < (MIDSCALE - DEADBAND)) keyState = 'a';
+  if (y > (MIDSCALE + DEADBAND)) keyState = 's';  // Y appears reversed
+  if (y < (MIDSCALE - DEADBAND)) keyState = 'w';
+  if (push) keyState = 'e';
 
-  if(r1 > 300) {  // Row 1 is pressed
-    if (r1 > 2000) return 9;
-    if (r1 > 800) return 7;
-    return 8;
-  }
+  //sprintf(buffer,"Keyscan: X=%4d, Y=%4d, P=%4d -> key='%c'",x,y,push,keyState ? keyState : ' ');
+  //USB_SERIAL_PORT.println(buffer);
 
-  if(r2 > 1000) {  // Row 2 is pressed
-    if (r2 > 3600) return 6;
-    if (r2 > 2800) return 4;
-    return 5;
-  }
-
-  if(r3 > 1000) {  // Row 3 is pressed
-    if (r3 > 3600) return 3;
-    if (r3 > 2800) return 1;
-    return 2;
-  }
-
-  return 0; // Nothing pressed
+  return keyState;
 }
-
 
 // Obsolete code for TM1637 display
 #if 0
